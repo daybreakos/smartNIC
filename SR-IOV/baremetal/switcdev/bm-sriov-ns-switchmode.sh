@@ -117,6 +117,72 @@ check_dependencies() {
     fi
 }
 
+force_switchdev() {
+    local target_iface="$1"
+    if [[ -z "$target_iface" ]]; then
+        echo "Error: No interface specified." >&2
+        return 1
+    fi
+
+    local netdir="/sys/class/net/$target_iface"
+    if [[ ! -d "$netdir" ]]; then
+        echo "Error: Interface '$target_iface' does not exist." >&2
+        return 1
+    fi
+
+    local devpath="$netdir/device"
+    if [[ ! -e "$devpath" ]]; then
+        echo "Error: No device path found for '$target_iface'." >&2
+        return 1
+    fi
+
+    # Verify it's an mlx5_core device PF (requires sriov_totalvfs)
+    local driver=""
+    if [[ -e "$devpath/driver" ]]; then
+        driver=$(basename "$(readlink -f "$devpath/driver")")
+    fi
+    if [[ "$driver" != "mlx5_core" || ! -e "$devpath/sriov_totalvfs" ]]; then
+        echo "Error: Interface '$target_iface' is not a valid mlx5 PF." >&2
+        return 1
+    fi
+
+    # Retrieve PCI BDF directly from sysfs
+    local pci
+    pci=$(basename "$(readlink -f "$devpath")")
+
+    # Get current eSwitch mode via devlink
+    local mode
+    mode=$(devlink dev eswitch show "pci/$pci" 2>/dev/null | grep -oE 'mode (legacy|switchdev)' | awk '{print $2}')
+    [[ -z "$mode" ]] && mode="unknown"
+
+    if [[ "$mode" == "legacy" ]]; then
+        echo "Interface $target_iface ($pci) is in legacy mode. Switching to switchdev..."
+
+        # Clear VFs first if any are active, as required by the driver
+        local cur
+        cur=$(cat "$devpath/sriov_numvfs" 2>/dev/null || echo 0)
+        if (( cur > 0 )); then
+            echo "Clearing active VFs ($cur) on $target_iface..."
+            echo 0 > "$devpath/sriov_numvfs" || {
+                echo "Error: Failed to clear VFs on $target_iface." >&2
+                return 1
+            }
+        fi
+
+        if devlink dev eswitch set "pci/$pci" mode switchdev; then
+            echo "Successfully set eSwitch mode 'switchdev' on $target_iface ($pci)."
+        else
+            echo "Error: Failed to set switchdev mode via devlink." >&2
+            return 1
+        fi
+    elif [[ "$mode" == "switchdev" ]]; then
+        echo "Interface $target_iface ($pci) is already in switchdev mode. Ignoring."
+    else
+        echo "Error: Interface $target_iface has an unknown eSwitch mode ('$mode')." >&2
+        return 1
+    fi
+}
+
 # State Management
 set_setup_flag() {
     cat > "${STATE_FILE}" <<EOF
@@ -676,6 +742,8 @@ show_menu() {
 main() {
     require_root
     check_dependencies
+    force_switchdev "${LEFT_PF}"
+    force_switchdev "${RIGHT_PF}"
 
     while true; do
         show_menu
