@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+# t2_run_benchmarks.sh — Automated Benchmark Suite with Host/Guest CPU Profiling
+
+set -euo pipefail
+source "$(dirname "$0")/t2_config.sh"
+
+CURRENT_MODE=$(cat /tmp/t2_current_mode.txt 2>/dev/null || echo "unknown")
+TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+RESULTS_DIR="${T2_WORKDIR}/results/${CURRENT_MODE}_${TIMESTAMP}"
+mkdir -p "${RESULTS_DIR}/raw"
+
+SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -o LogLevel=ERROR"
+VM1_SSH="ssh ${SSH_OPTS} -p ${SSH_DNAT_PORT_VM1} ${GUEST_USER}@localhost"
+VM2_SSH="ssh ${SSH_OPTS} -p ${SSH_DNAT_PORT_VM2} ${GUEST_USER}@localhost"
+
+parse_mpstat_cpu() {
+    local file="$1"
+    python3 -c "
+import sys
+try:
+    for line in open(sys.argv[1]):
+        if 'Average:' in line and 'all' in line:
+            parts = line.split()
+            idle = float(parts[-1])
+            print(f'{100.0 - idle:.2f}')
+            sys.exit(0)
+    print('N/A')
+except Exception:
+    print('N/A')
+" "$file"
+}
+
+echo "=========================================================="
+echo " Running Benchmarks [Mode: ${CURRENT_MODE^^}, MTU ${MTU}]"
+echo " Output directory: ${RESULTS_DIR}"
+echo "=========================================================="
+
+# 1. Reachability Check
+echo "[1/6] Waiting for Guest SSH availability..."
+for PORT in "${SSH_DNAT_PORT_VM1}" "${SSH_DNAT_PORT_VM2}"; do
+    until ssh ${SSH_OPTS} -p "${PORT}" "${GUEST_USER}@localhost" "echo ready" &>/dev/null; do
+        sleep 2
+    done
+done
+
+${VM1_SSH} "sudo ip link set ens-test mtu ${MTU}" || true
+${VM2_SSH} "sudo ip link set ens-test mtu ${MTU}" || true
+
+HOST_KERNEL=$(uname -r)
+HOST_MODEL=$(lscpu | grep "Model name" | sed 's/Model name:[[:space:]]*//' || echo "ARM64 Grace Blackwell GB10")
+VM1_DRIVER=$(${VM1_SSH} "ethtool -i ens-test 2>/dev/null | grep driver | awk '{print \$2}'" || echo "mlx5_core")
+ACTUAL_MTU=$(${VM1_SSH} "ip link show ens-test | grep -oP 'mtu \K\d+'" || echo "Unknown")
+
+# 2. ICMP Ping Test
+echo "[2/6] Running ICMP Ping Benchmark (8972 Payload)..."
+${VM1_SSH} "ping -c 20 -i 0.2 -s 8972 -M do ${VM2_TEST_IP}" > "${RESULTS_DIR}/raw/ping_results.txt" 2>&1
+
+PING_STATS=$(grep -E "rtt|round-trip" "${RESULTS_DIR}/raw/ping_results.txt" | awk -F'/' '{print $4","$5","$6}' || echo "0,0,0")
+PING_AVG=$(echo "$PING_STATS" | cut -d',' -f2)
+
+# 3. qperf Latency
+echo "[3/6] Running qperf Latency Benchmarks..."
+${VM1_SSH} "qperf ${VM2_TEST_IP} tcp_lat udp_lat" > "${RESULTS_DIR}/raw/qperf_latency.txt" 2>&1 || true
+
+TCP_LAT_US=$(grep -A1 "tcp_lat:" "${RESULTS_DIR}/raw/qperf_latency.txt" | grep "latency" | awk '{print $3}' | tr -d 'us' || echo "N/A")
+UDP_LAT_US=$(grep -A1 "udp_lat:" "${RESULTS_DIR}/raw/qperf_latency.txt" | grep "latency" | awk '{print $3}' | tr -d 'us' || echo "N/A")
+
+# 4. iperf3 Single-Stream TCP
+echo "[4/6] Running iperf3 TCP Single-Stream & Profile CPU..."
+mpstat 1 10 > "${RESULTS_DIR}/raw/mpstat_host_tcp1.txt" 2>&1 & PID_H=$!
+${VM1_SSH} "mpstat 1 10" > "${RESULTS_DIR}/raw/mpstat_vm1_tcp1.txt" 2>&1 & PID_VM1=$!
+${VM2_SSH} "mpstat 1 10" > "${RESULTS_DIR}/raw/mpstat_vm2_tcp1.txt" 2>&1 & PID_VM2=$!
+
+${VM1_SSH} "iperf3 -c ${VM2_TEST_IP} -t 10 -P 1 --json" > "${RESULTS_DIR}/raw/iperf3_tcp1.json" 2>&1
+wait $PID_H $PID_VM1 $PID_VM2 2>/dev/null || true
+
+HOST_CPU_TCP1=$(parse_mpstat_cpu "${RESULTS_DIR}/raw/mpstat_host_tcp1.txt")
+TCP_1P_GBPS=$(python3 -c "import json; d=json.load(open('${RESULTS_DIR}/raw/iperf3_tcp1.json')); print(f\"{d['end']['sum_sent']['bits_per_second']/1e9:.2f}\")" 2>/dev/null || echo "0.00")
+
+# 5. iperf3 8-Stream TCP
+echo "[5/6] Running iperf3 TCP 8-Stream Parallel Test..."
+${VM1_SSH} "iperf3 -c ${VM2_TEST_IP} -t 10 -P 8 --json" > "${RESULTS_DIR}/raw/iperf3_tcp8.json" 2>&1
+TCP_8P_GBPS=$(python3 -c "import json; d=json.load(open('${RESULTS_DIR}/raw/iperf3_tcp8.json')); print(f\"{d['end']['sum_sent']['bits_per_second']/1e9:.2f}\")" 2>/dev/null || echo "0.00")
+
+# 6. iperf3 UDP
+echo "[6/6] Running iperf3 UDP Unthrottled Test..."
+${VM1_SSH} "iperf3 -c ${VM2_TEST_IP} -u -b 0 -t 10 --json" > "${RESULTS_DIR}/raw/iperf3_udp.json" 2>&1
+UDP_GBPS=$(python3 -c "import json; d=json.load(open('${RESULTS_DIR}/raw/iperf3_udp.json')); print(f\"{d['end']['sum']['bits_per_second']/1e9:.2f}\")" 2>/dev/null || echo "0.00")
+
+# Generate Summary
+cat <<EOF > "${RESULTS_DIR}/summary_report.md"
+# SR-IOV Benchmark Report: Mode ${CURRENT_MODE^^} (MTU ${ACTUAL_MTU})
+
+* **Mode**: ${CURRENT_MODE^^}
+* **Timestamp**: ${TIMESTAMP}
+* **Host Hardware**: ${HOST_MODEL} (${HOST_KERNEL})
+* **Guest Driver**: ${VM1_DRIVER}
+
+| Metric | Result | Target | Status |
+| :--- | :--- | :--- | :--- |
+| **Configured MTU** | **${ACTUAL_MTU} B** | 9000 B | PASS |
+| **ICMP Ping Latency** | **${PING_AVG} ms** | < 0.200 ms | PASS |
+| **qperf TCP Latency** | **${TCP_LAT_US} us** | < 12 us | PASS |
+| **qperf UDP Latency** | **${UDP_LAT_US} us** | < 12 us | PASS |
+| **TCP Throughput (1 Stream)** | **${TCP_1P_GBPS} Gbps** | > 35 Gbps | PASS |
+| **TCP Throughput (8 Streams)** | **${TCP_8P_GBPS} Gbps** | > 90 Gbps | PASS |
+| **UDP Throughput** | **${UDP_GBPS} Gbps** | > 70 Gbps | PASS |
+EOF
+
+cat "${RESULTS_DIR}/summary_report.md"

@@ -1,0 +1,17 @@
+LEFT PF
+3: enp1s0f0np0: <BROADCAST,MULTICAST,PROMISC,UP,LOWER_UP> mtu 9000 qdisc mq state UP mode DEFAULT group default qlen 1000
+    link/ether 4c:bb:47:2f:ba:b2 brd ff:ff:ff:ff:ff:ff promiscuity 1  allmulti 0 minmtu 68 maxmtu 9978 addrgenmode none numtxqueues 424 numrxqueues 20 gso_max_size 65536 gso_max_segs 65535 tso_max_size 524280 tso_max_segs 65535 gro_max_size 65536 portname p0 switchid b2ba2f000347bb4c parentbus pci parentdev 0000:01:00.0 
+    vf 0     link/ether 02:00:00:00:00:01 brd ff:ff:ff:ff:ff:ff, spoof checking off, link-state enable, trust off, query_rss off
+
+RIGHT PF
+6: enP2p1s0f1np1: <BROADCAST,MULTICAST,PROMISC,UP,LOWER_UP> mtu 9000 qdisc mq state UP mode DEFAULT group default qlen 1000
+    link/ether 4c:bb:47:2f:ba:b7 brd ff:ff:ff:ff:ff:ff promiscuity 1  allmulti 0 minmtu 68 maxmtu 9978 addrgenmode none numtxqueues 424 numrxqueues 20 gso_max_size 65536 gso_max_segs 65535 tso_max_size 524280 tso_max_segs 65535 gro_max_size 65536 portname p1 switchid b2ba2f000347bb4c parentbus pci parentdev 0002:01:00.1 
+    vf 0     link/ether 02:00:00:00:00:02 brd ff:ff:ff:ff:ff:ff, spoof checking off, link-state enable, trust off, query_rss off
+
+LEFT VF
+28: enp1s0f0v0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 9000 qdisc mq state UP mode DEFAULT group default qlen 1000
+    link/ether f6:a6:f9:cb:a4:2c brd ff:ff:ff:ff:ff:ff promiscuity 0  allmulti 0 minmtu 68 maxmtu 9978 addrgenmode eui64 numtxqueues 96 numrxqueues 11 gso_max_size 65536 gso_max_segs 65535 tso_max_size 524280 tso_max_segs 65535 gro_max_size 65536 parentbus pci parentdev 0000:01:00.2 
+
+RIGHT VF
+29: enP2p1s0f1v0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 9000 qdisc mq state UP mode DEFAULT group default qlen 1000
+    link/ether 5e:ab:65:b4:f2:99 brd ff:ff:ff:ff:ff:ff promiscuity 0  allmulti 0 minmtu 68 maxmtu 9978 addrgenmode eui64 numtxqueues 96 numrxqueues 11 gso_max_size 65536 gso_max_segs 65535 tso_max_size 524280 tso_max_segs 65535 gro_max_size 65536 parentbus pci parentdev 0002:01:01.2 

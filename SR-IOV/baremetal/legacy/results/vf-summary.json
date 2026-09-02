@@ -1,0 +1,49 @@
+{
+  "test_type": "sriov_vf_to_vf_baremetal",
+  "timestamp": "2026-09-02 15:03:57 CST",
+
+  "left_pf": "enp1s0f0np0",
+  "right_pf": "enP2p1s0f1np1",
+
+  "left_vf": "enp1s0f0v0",
+  "right_vf": "enP2p1s0f1v0",
+
+  "left_vf_index": 0,
+  "right_vf_index": 0,
+
+  "left_namespace": "left-vf-ns",
+  "right_namespace": "right-vf-ns",
+
+  "left_ip": "10.0.0.1",
+  "right_ip": "10.0.0.2",
+
+  "mtu": 9000,
+
+  "tcp_throughput_gbps": 98.35,
+
+  "udp_throughput_gbps": 64.88,
+  "udp_pps": 1536124,
+  "udp_lost_percent": 40.988,
+  "udp_jitter_ms": 0.014046,
+
+  "icmp_rtt_ms": 0.021,
+
+  "tcp_host_cpu_busy_pct": 32.56,
+  "udp_host_cpu_busy_pct": 69.94,
+
+  "tcp_parallel_streams": 8,
+  "udp_packet_length": 8948,
+  "udp_streams": 8,
+  "iperf3_duration_sec": 10,
+
+  "raw_tcp_result": "./results/sriov-vf-20260902-150357/tcp.json",
+  "raw_udp_result": "./results/sriov-vf-20260902-150357/udp.json",
+
+  "vf_left_stats_before": "./results/sriov-vf-20260902-150357/left-vf-stats.txt.before",
+  "vf_left_stats_after": "./results/sriov-vf-20260902-150357/left-vf-stats.txt.after",
+
+  "vf_right_stats_before": "./results/sriov-vf-20260902-150357/right-vf-stats.txt.before",
+  "vf_right_stats_after": "./results/sriov-vf-20260902-150357/right-vf-stats.txt.after",
+
+  "note": "VF-to-VF traffic may be internally switched by the NIC depending on hardware/driver configuration; this test alone does not prove external DAC traversal."
+}
