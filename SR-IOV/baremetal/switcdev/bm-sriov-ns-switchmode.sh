@@ -63,10 +63,10 @@ PING_TIMEOUT=1
 
 # iperf3
 IPERF_DURATION=60
-IPERF_TCP_STREAMS=4
+IPERF_TCP_STREAMS=8
 IPERF_UDP_BANDWIDTH="50G"
 IPERF_UDP_LENGTH=8948
-IPERF_UDP_STREAMS=1
+IPERF_UDP_STREAMS=8
 
 # Results
 RESULTS_DIR="./results"
@@ -708,6 +708,7 @@ reset_host_and_quit() {
     fi
     ip link set "${LEFT_PF}" mtu 1500 2>/dev/null || true
     ip link set "${RIGHT_PF}" mtu 1500 2>/dev/null || true
+
     exit 0
 }
 
