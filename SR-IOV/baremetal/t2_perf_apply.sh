@@ -64,15 +64,26 @@ fi
 
 echo "TCPIP Tuning: "
 # Increase maximum socket receive and send buffer sizes for high-speed links
-sudo sysctl -w net.core.rmem_max=67108864
-sudo sysctl -w net.core.wmem_max=67108864
-sudo sysctl -w net.core.rmem_default=33554432
-sudo sysctl -w net.core.wmem_default=33554432
-sudo sysctl -w net.core.optmem_max=67108864
+# TCPIP tuning parameters for 100/200 Gbps cards:
 
-# Increase Linux auto-tuning TCP buffer limits (min, default, max in bytes)
-sudo sysctl -w net.ipv4.tcp_rmem="4096 87380 33554432"
-sudo sysctl -w net.ipv4.tcp_wmem="4096 65536 33554432"
+sudo sysctl -w net.core.rmem_max=536870912
+sudo sysctl -w net.core.wmem_max=536870912
+sudo sysctl -w net.ipv4.tcp_rmem="4096 87380 536870912"
+sudo sysctl -w net.ipv4.tcp_wmem="4096 65536 536870912"
+#sudo sysctl -w net.core.default_qdisc=fq
+#sudo sysctl -w net.ipv4.tcp_congestion_control=bbr
+
+
+# TCPIP tuning parameters for 100/200 Gbps cards:
+# sudo sysctl -w net.core.rmem_max=67108864
+# sudo sysctl -w net.core.wmem_max=67108864
+# sudo sysctl -w net.core.rmem_default=33554432
+# sudo sysctl -w net.core.wmem_default=33554432
+# sudo sysctl -w net.core.optmem_max=67108864
+#
+# # Increase Linux auto-tuning TCP buffer limits (min, default, max in bytes)
+# sudo sysctl -w net.ipv4.tcp_rmem="4096 87380 33554432"
+# sudo sysctl -w net.ipv4.tcp_wmem="4096 65536 33554432"
 
 # Increase the processor input queue to handle heavy burst traffic without dropping packets
 sudo sysctl -w net.core.netdev_max_backlog=250000
