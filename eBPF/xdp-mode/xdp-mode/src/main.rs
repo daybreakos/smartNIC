@@ -6,6 +6,10 @@ use aya::{
 };
 use clap::Parser;
 use log::{debug, warn, info};
+use std::{
+    thread,
+    time::{Duration, Instant},
+};
 use tokio::signal;
 
 //#[rustfmt::skip]
@@ -105,18 +109,43 @@ async fn main() -> anyhow::Result<()> {
     println!("==========================================\n");
 
     if opt.watch {
-        println!("Watch mode enabled. Printing live packet counts (Ctrl+C to exit)...");
-     
-        //let mut packet_count: Array<_, u64> = Array::try_from(ebpf.map_mut("PACKET_COUNT").unwrap())?;
-        let packet_count: Array<_, u64> = Array::try_from(ebpf.map_mut("PACKET_COUNT").unwrap())?;
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
-     
+        println!("Watch mode enabled. Printing live metrics (Ctrl+C to exit)...\n");
+
+        let mut packet_count: Array<_, u64> = Array::try_from(ebpf.map_mut("PACKET_COUNT").unwrap())?;
+
+        // Initialize state variables for delta metrics
+        let mut prev_count: u64 = packet_count.get(&0, 0).unwrap_or(0);
+        let mut prev_time = Instant::now();
+
         tokio::select! {
             _ = async {
                 loop {
-                    interval.tick().await;
-                    if let Ok(count) = packet_count.get(&0, 0) {
-                        println!("[{}] Total Packets Processed: {}", opt.iface, count);
+                    // Sleep for 1 second between samples
+                    tokio::task::spawn_blocking(|| thread::sleep(Duration::from_secs(1))).await.ok();
+
+                    let current_time = Instant::now();
+                    if let Ok(current_count) = packet_count.get(&0, 0) {
+                        // Calculate time delta in seconds
+                        let elapsed_secs = current_time.duration_since(prev_time).as_secs_f64();
+                        
+                        // Calculate packet delta (safely handling potential overflow/resets)
+                        let delta_packets = current_count.saturating_sub(prev_count);
+                        
+                        // Calculate rate
+                        let pps = if elapsed_secs > 0.0 {
+                            delta_packets as f64 / elapsed_secs
+                        } else {
+                            0.0
+                        };
+
+                        println!(
+                            "[{}] Total Packets: {:<12} | Live Rate: {:>10.2} p/s",
+                            opt.iface, current_count, pps
+                        );
+
+                        // Update previous state
+                        prev_count = current_count;
+                        prev_time = current_time;
                     }
                 }
             } => {},
