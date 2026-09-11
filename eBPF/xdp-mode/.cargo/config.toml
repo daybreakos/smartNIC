@@ -1,2 +1,10 @@
 [target."cfg(all())"]
 runner = "sudo -E"
+
+
+[alias]
+cross = "build --target aarch64-unknown-linux-musl --release"
+
+[target.aarch64-unknown-linux-musl]
+linker = "aarch64-linux-musl-gcc"
+ar = "aarch64-linux-musl-ar"
