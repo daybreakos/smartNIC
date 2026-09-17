@@ -249,26 +249,26 @@ make clean      # removes both
    ```
 
    Confirm that pkts are actually hitting the interface:
+
    ```bash 
    sudo xdpdump -x -i enp1s0f0np0
-listening on enp1s0f0np0, ingress XDP program ID 929 func xdp_afxdp_icmp_redirect, capture mode entry, capture size 262144 bytes
-1789630372.698442452: xdp_afxdp_icmp_redirect()@entry: packet size 98 bytes, captured 98 bytes on if_index 3, rx queue 0, id 1
-  0x0000:  6c b3 11 88 55 b4 6c b3 11 88 55 b5 08 00 45 00  l...U.l...U...E.
-  0x0010:  00 54 3f 33 40 00 40 01 b2 0e c0 a8 64 0c c0 a8  .T?3@.@.....d...
-  0x0020:  64 0a 08 00 16 47 e2 d9 00 1f a5 97 ab 6a 00 00  d....G.......j..
-  0x0030:  00 00 ec ea 02 00 00 00 00 00 10 11 12 13 14 15  ................
-  0x0040:  16 17 18 19 1a 1b 1c 1d 1e 1f 20 21 22 23 24 25  .......... !"#$%
-  0x0050:  26 27 28 29 2a 2b 2c 2d 2e 2f 30 31 32 33 34 35  &'()*+,-./012345
-  0x0060:  36 37                                            67
-1789630373.722449640: xdp_afxdp_icmp_redirect()@entry: packet size 98 bytes, captured 98 bytes on if_index 3, rx queue 0, id 2
-  0x0000:  6c b3 11 88 55 b4 6c b3 11 88 55 b5 08 00 45 00  l...U.l...U...E.
-  0x0010:  00 54 42 29 40 00 40 01 af 18 c0 a8 64 0c c0 a8  .TB)@.@.....d...
-  0x0020:  64 0a 08 00 5b e8 e2 d9 00 20 a6 97 ab 6a 00 00  d...[.... ...j..
-  0x0030:  00 00 a5 48 03 00 00 00 00 00 10 11 12 13 14 15  ...H............
-  0x0040:  16 17 18 19 1a 1b 1c 1d 1e 1f 20 21 22 23 24 25  .......... !"#$%
-  0x0050:  26 27 28 29 2a 2b 2c 2d 2e 2f 30 31 32 33 34 35  &'()*+,-./012345
-  0x0060:  36 37
-  ....
+   listening on enp1s0f0np0, ingress XDP program ID 929 func xdp_afxdp_icmp_redirect, capture mode entry, capture size 262144 bytes
+   1789630372.698442452: xdp_afxdp_icmp_redirect()@entry: packet size 98 bytes, captured 98 bytes on if_index 3, rx queue 0, id 1
+   0x0000:  6c b3 11 88 55 b4 6c b3 11 88 55 b5 08 00 45 00  l...U.l...U...E.
+   0x0010:  00 54 3f 33 40 00 40 01 b2 0e c0 a8 64 0c c0 a8  .T?3@.@.....d...
+   0x0020:  64 0a 08 00 16 47 e2 d9 00 1f a5 97 ab 6a 00 00  d....G.......j..
+   0x0030:  00 00 ec ea 02 00 00 00 00 00 10 11 12 13 14 15  ................
+   0x0040:  16 17 18 19 1a 1b 1c 1d 1e 1f 20 21 22 23 24 25  .......... !"#$%
+   0x0050:  26 27 28 29 2a 2b 2c 2d 2e 2f 30 31 32 33 34 35  &'()*+,-./012345
+   0x0060:  36 37                                            67
+   1789630373.722449640: xdp_afxdp_icmp_redirect()@entry: packet size 98 bytes, captured 98 bytes on if_index 3, rx queue 0, id 2
+   0x0000:  6c b3 11 88 55 b4 6c b3 11 88 55 b5 08 00 45 00  l...U.l...U...E.
+   0x0010:  00 54 42 29 40 00 40 01 af 18 c0 a8 64 0c c0 a8  .TB)@.@.....d...
+   0x0020:  64 0a 08 00 5b e8 e2 d9 00 20 a6 97 ab 6a 00 00  d...[.... ...j..
+   0x0030:  00 00 a5 48 03 00 00 00 00 00 10 11 12 13 14 15  ...H............
+   0x0040:  16 17 18 19 1a 1b 1c 1d 1e 1f 20 21 22 23 24 25  .......... !"#$%
+   0x0050:  26 27 28 29 2a 2b 2c 2d 2e 2f 30 31 32 33 34 35  &'()*+,-./012345
+   0x0060:  36 37
    ```
 
 
