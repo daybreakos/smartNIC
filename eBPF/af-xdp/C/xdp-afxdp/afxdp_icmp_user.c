@@ -62,6 +62,8 @@ struct xsk_socket_info {
 static volatile sig_atomic_t g_stop;
 static unsigned long g_icmp_count;   /* E: the packet counter */
 
+static __u32 g_xdp_flags = XDP_FLAGS_DRV_MODE;
+
 static void handle_sigint(int sig)
 {
     (void)sig;
@@ -100,9 +102,13 @@ static int load_and_attach_xdp(const char *obj_path, int ifindex,
     /* Native (driver) mode; swap to SKB mode for testing on interfaces
      * without native XDP support (e.g. veth in some configs). */
     if (bpf_xdp_attach(ifindex, prog_fd, XDP_FLAGS_DRV_MODE, NULL) < 0) {
-        fprintf(stderr, "ERR: attaching XDP program to ifindex %d failed\n",
-                ifindex);
-        return -1;
+        fprintf(stderr, "Notice: Native XDP mode not supported. Falling back to SKB (generic) mode...\n");
+        g_xdp_flags = XDP_FLAGS_SKB_MODE;
+
+        if (bpf_xdp_attach(ifindex, prog_fd, g_xdp_flags, NULL) < 0) {
+            fprintf(stderr, "ERR: attaching XDP program (both DRV and SKB modes) to ifindex %d failed\n", ifindex);
+            return -1;
+        }
     }
 
     map_fd = bpf_object__find_map_fd_by_name(obj, XSKS_MAP_NAME);
@@ -179,7 +185,8 @@ static struct xsk_socket_info *configure_socket(struct xsk_umem_info *umem,
         .rx_size = RX_RING_SIZE,
         .tx_size = TX_RING_SIZE,
         .libxdp_flags = XSK_LIBXDP_FLAGS__INHIBIT_PROG_LOAD, //XSK_LIBXDP_FLAGS_INHIBIT_PROG_LOAD,
-        .xdp_flags = XDP_FLAGS_DRV_MODE,
+        /* .xdp_flags = XDP_FLAGS_DRV_MODE, */
+        .xdp_flags =  g_xdp_flags, // Automatically match what succeeded 
         .bind_flags = XDP_USE_NEED_WAKEUP,
     };
     int ret;
@@ -315,7 +322,8 @@ int main(int argc, char **argv)
     xsk_socket__delete(xsk->xsk);
     xsk_umem__delete(umem->umem);
     free(umem->buffer);
-    bpf_xdp_attach(ifindex, -1, XDP_FLAGS_DRV_MODE, NULL);
+    // bpf_xdp_attach(ifindex, -1, XDP_FLAGS_DRV_MODE, NULL);
+    bpf_xdp_attach(ifindex, -1, g_xdp_flags, NULL);
     bpf_object__close(bpf_obj);
 
     printf("Final ICMP count: %lu\n", g_icmp_count);
