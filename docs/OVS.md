@@ -5,7 +5,8 @@
 OVS is a multi-layer SW switch, Its designed to operate a virtual switch within Hypervisor and Container
 environments such as KVM, Xen, Proxmox, to handle traffic between VM's and external physical networks. 
 
-Since Hypervisor ( KVM ) and containers ( docker ) are built on top of standard Linux networking, "OVS" runs as native system daemon directly on the host OS. 
+Since Hypervisor ( KVM ) and containers ( docker ) are built on top of standard Linux networking, "OVS" runs
+as native system daemon directly on the host OS. 
 
 You can use Open vSwitch on standard Linux bare-metal server or desktop to replace or augment the
 traditional Linux bridge ( `bridge-utils` / `ip link add br0 type bridge` ).
@@ -418,6 +419,440 @@ The Linux kernel OVS datapath handles forwarding, while OpenFlow provides a prog
 forwarding decisions
 
 ---
+
+# Network Flows and OVS :
+
+A **Flow** is a sequence of related network packets that share common characteristics ( like Source and
+destination IP address, ports or protocol types )
+
+> Instead of looking at every single TCP packet as a brand new event an entire web browsing session or a
+> video stream can be identified as s single flow. 
+
+**Flow Table**: It's a data structure inside a programmable network switch ( commonly used in SDN ) that
+stores a set of flow entries to decide how to process and forward those packets. 
+
+Flow table replace or extend traditional static switching/routing tables with programmable database rules.
+When a packet arrives at a switch the switch inspects the packet against the flow table. 
+
+Each Flow entries inside a flow table typically contains:
+
+- **Match Field**: Criteria to identify specific packets (ex: Specified destination IP and TCP port )
+
+- **Priority**: Determines the order of evaluation if a packet matches multiple rules. 
+
+- **Counters**: Track statistics like the total number of matching packets and bytes. 
+
+- **Instructions/Actions**: What to do with the matching packet ( ex: forward out a specific port drop the
+  packet, modify VLAN/IP headers or send the packet to an SDN Controller. )
+
+- **Timeout**: Idle of hard timers that remove old or unused flow entries automatically. 
+
+*How does all of this work*:
+
+- **Packets arrival**: A packet enters a _openFlow_ enabled switch. 
+
+- **Table Lookup**: Switch compares the packet against the _flow table_.
+
+- **Action Execution** If a match is found, the switch performs the defined action ( such as forwarding or
+  altering the packet ), for more advanced switched, packets can pass through a pipeline of multiple
+  sequential flow tables using `Goto-Table` instructions.
+
+- **Table-Miss**: If no rule matches the packet, a fallback rule ( the Table-Miss entry ) dictates whether
+  to drop the packet, flood it, or forward it up to a centralized software controller for instructions. 
+
+## How OVS implements flows:
+
+**OVS** operates both spaces:
+    - user-space: complex decisions and SDN protocol handling happen
+    - kernel space: Packet are forwarded at blazing fast speeds. 
+    
+To achieve high performance, **OVS** splits its flow processing into two distinct parts: 
+
+1. **OpenFlow tables ( user-space: handled by `ovs-vswitchd` )**:
+
+- This is where your actual SDN controller ( like ONOS, OpenDaylight ) or manual configuration scripts
+  inject routing logic. 
+
+- It supports multiple pipeline tables, wildcard matching, priorities, and intricate routing logic. 
+
+- Because matching packets against deep complex rules takes time, running every single packet through these
+  user-space tables would severely bottleneck network performance.
+
+2. **The Datapath ( kernel space / openvswitch.ko )**:
+
+- To solve the spreed issue, OVS utilizes a kernel-space cache called the **DataPath**.
+
+- When a packet first arrives, if the kernel does not recognize it, it sends it up to the user space
+  ("upcall").
+
+- The user-space daemon checks its multi-table OpenFlow rules, decided what to do and then installs a
+  incredibly simple, exact-match rule directly into the kernel datapath. 
+
+- Subsequent packets in that exact same stream match the kernel cache immediately and never leave the kernep
+  space, resulting in near-line-rate forwarding speeds. 
+
+### The Evolution of OVS Flow Tables
+
+As networks grew larger, exact-match caching wasn't enough because any slight variation in a packet (like a
+changing port number) triggered a slow user-space upcall. OVS engineered two primary technologies to make
+flow tables even smarter:
+
+| Flow Technology | How it Works | Primary Benefit |
+| :--- | :--- | :--- |
+| Microflow Caching	| Matches packets on an exact 1:1 basis across all header fields. | Super fast, but handles wildcards poorly; easily flooded by new connections. |
+| Megaflow Caching | Group-based classifier that allows wildcarding in the kernel datapath (e.g., matching a whole subnet instead of one IP). | Drastically reduces upcalls to user space for varied traffic.|
+
+
+
+### More on Flow: 
+
+Traditional switches look at the destination MAC address and decides which port should receive the packet. 
+
+OVS inspects multiple packet fields and make forwarding decisions based on them. 
+
+Ex:
+```text 
+Match:
+    Source MAC       = AA:BB:CC:DD:EE:FF
+    Destination MAC  = 11:22:33:44:55:66
+    VLAN ID          = 100
+    Source IP        = 192.168.1.10
+    Destination IP   = 192.168.2.20
+    Protocol         = TCP
+    Destination Port = 443
+
+Action:
+    Output to port 5
+```
+
+This combination of:
+
+- Match criteria
+- Actions
+
+is called a **Flow**.
+
+In OVS, flows are stored in flow tables and evaluated against incoming packets.
+
+
+### Packet processing Architecture:
+
+Let's look at the general architecture.
+
+Discover Open vSwitch (OVS): What Is It and How Does It Work?
+
+[open vSwitch Arch](https://cloudification.io/cloud-blog/open-vswitch-ovs-what-is-it-and-how-does-open-virtual-switch-work)
+
+![](https://cloudification.io/wp-content/uploads/2025/02/Open_vSwitch_Architecture.webp =360x)
+
+
+**OVS** has two important components:
+
+1. **Control plane**: `ovs-vswitchd` (userspace daemon).
+2. **Data plane**: Kernel datapath or a userspace datapath such as DPDK.
+
+Consider what happens when a packet arrives.
+
+**Packet processing in OVS**
+
+```text 
+           Incoming Packet ( physical NIC / Virtual NIC )
+                 |
+                 v
+        +-------------------+
+        | Datapath Flow     |( Is there an existing matching flow? )
+        | Lookup            | 
+        +-------------------+
+                 |
+         +-------+-------+
+         |               |
+        HIT             MISS
+         |               |
+         v               v
+  +-------------+  +---------------------------+
+  | Execute     |  | Upcall to                 |
+  | Flow Actions|  | ovs-vswitchd              |
+  | (fast path )|  |ovs-vswitchd processes pkt |
+  +-------------+  +---------------------------+
+         |               |
+         |               v
+         |        +-----------------+
+         |        | Flow Processing | ( Subsequent matching packets can use the fast path )
+         |        | and Installation|
+         |        +-----------------+
+         |               |
+         +-------+-------+
+                 |
+                 v
+          Packet Forwarding
+```
+
+This brings us to the different types of flows.
+
+### SW Flows (Software Flows)
+
+These flows are processed by software rather than directly by NIC hardware.
+
+For example, with the Linux kernel datapath:
+
+- Packet arrives at the NIC.
+- Linux receives the packet.
+- OVS kernel datapath looks up a matching flow.
+- If a matching flow exists, its actions are executed.
+- The packet is forwarded without requiring userspace processing for every packet.
+
+The important distinction:
+
+**A software flow does not necessarily mean that every packet is processed by the OVS userspace daemon.**
+
+The Linux kernel can process packets very efficiently using its datapath flow cache.
+
+You can inspect software datapath flows using:
+
+```bash
+sudo ovs-appctl dpctl/dump-flows
+```
+
+Example output:
+
+```text
+recirc_id(0),in_port(1),eth_type(0x0800),
+ipv4(src=192.168.1.10,dst=192.168.2.20),
+tcp(dst=443), packets:100, bytes:12000,
+used:0.5s, actions:output(2)
+```
+
+This is a software datapath flow.
+
+###  HW Flows (Hardware Offloaded Flows)
+
+Modern NICs have hardware packet-processing capabilities.
+
+Instead of asking the CPU to process every packet, OVS can offload flow rules into the NIC.
+
+For example:
+
+```text
+Match:
+    Source IP      = 192.168.1.10
+    Destination IP = 192.168.2.20
+    Protocol       = TCP
+    Destination Port = 443
+
+Action:
+    Forward to physical port
+```
+
+or 
+```text 
+    +----------------------------------------------|+
+    | Example: Three TCP connections                |
+    |                                               |
+    | Connection A:                        Flow A   |
+    | 192.168.1.10:50000 → 10.0.0.20:443            |
+    +---------------------------------------------- +
+    | Connection B                         Flow B   |
+    | 192.168.1.11:50001 → 10.0.0.20:443            |
+    +---------------------------------------------- +
+    | Connection C                         Flow C   |
+    | 192.168.1.10:50002 → 10.0.0.30:80             |
+    +---------------------------------------------- |+
+```
+
+Although all three connections use TCP, they have different identifying fields.
+
+A flow is typically identified by a combination of packet-header fields, commonly called a 5-tuple:
+
+| Field | Example |
+| --- | --- |
+| Source IP | 192.168.1.10 |
+| Destination IP | 10.0.0.20 |
+| Source port | 50000 |
+| Destination port | 443 |
+| Protocol | TCP |
+
+This combination identifies Flow A.
+
+However, a flow does not always have to use all five fields. Depending on the flow definition, it might match only:
+
+- Source and destination MAC addresses.
+- Source and destination IP addresses.
+- VLAN ID.
+- IP protocol.
+- TCP/UDP ports.
+- Tunnel ID or other metadata.
+
+OVS communicates this rule to the NIC driver, which programs the NIC's hardware flow tables.
+
+Now the NIC itself can:
+
+1. Receive the packet.
+2. Match its headers against the hardware flow rule.
+3. Execute the configured forwarding action.
+4. Forward the packet without normal host CPU packet processing.
+
+Link-Inline™ Software - Napatech
+
+[stateful flow mgmt and offloading napatech.com](https://www.napatech.com/products/link-inline-software)
+
+![napatech.com](https://www.napatech.com/wp-content/uploads/2026/10/Stateful-Flow-Management-Diagram-768x741.png =240x)
+
+This is called Hardware Flow Offloading.
+
+Some examples of hardware technologies involved:
+
+- Intel Ethernet Flow Director
+- Intel ADQ (Application Device Queues)
+- Mellanox/NVIDIA ConnectX hardware steering
+- TC flower hardware offload
+- NIC embedded switching (eSwitch)
+
+Not every NIC supports all flow matching and action combinations.
+
+```bash 
+# Look for `harware-tc-offload` to check if the driver supports HW flow offloading.
+# ethtool -k <interface_name> | grep "hw-tc-offload"
+
+ethtool -k enp1s0f0 |grep "hw-tc"
+hw-tc-offload: on
+
+# or for connectx NICs ( make sure the driver exposes representor device and supports `switchdev` mode
+# rather than `legacy` mode)
+# `devlink dev eswitch show pci/<bus_address>`
+
+# or check OVS kernel and Flow offload status ( return true )
+sudo ovs-vsctl get Open_vSwitch . other_config:hw-offload
+```
+
+## 5. SW Flow vs HW Flow
+
+| Feature | SW Flow | HW Flow |
+| --- | --- | --- |
+| Processing | CPU / software datapath | NIC hardware |
+| Flow storage | Kernel or userspace datapath | NIC hardware tables |
+| CPU utilization | Uses host CPU | Reduces host CPU usage |
+| Throughput | Depends on CPU and datapath | Can achieve high throughput |
+| Latency | Depends on software path | Can reduce processing latency |
+| Limitations | Software-supported actions | Hardware-supported match/actions |
+| Capacity | System memory / datapath limits | NIC hardware flow-table limits |
+
+One important detail: hardware offloading is not simply a matter of copying every OVS flow into the NIC. 
+The NIC must support the required match fields and actions.
+
+### How to inspect SW and HW flows in Linux
+
+This is where the practical OVS commands become useful.
+
+A. Check the OVS datapath type
+
+```bash
+ovs-vsctl get Bridge br0 datapath_type
+```
+
+Typical results:
+
+- Empty string: Linux kernel datapath.
+- `netdev`: Userspace datapath (often DPDK).
+
+B. Dump datapath flows
+
+```bash
+sudo ovs-appctl dpctl/dump-flows
+```
+
+C. Check hardware offloading configuration
+
+```bash
+ovs-vsctl get Open_vSwitch . other_config
+```
+
+Look for:
+
+```text
+hw-offload=true
+```
+
+You can also check:
+
+```bash
+ovs-vsctl get Open_vSwitch . other_config:hw-offload
+```
+
+D. Inspect TC hardware-offloaded rules
+
+```bash
+sudo tc -s filter show dev eth0 ingress
+```
+
+Look for:
+
+
+```text
+in_hw
+```
+
+This indicates that a rule has been installed in hardware.
+
+You may also see:
+
+
+```text 
+not_in_hw
+```
+
+This means the rule is not currently offloaded.
+
+### One more important distinction: OpenFlow vs Datapath Flows
+
+These two terms are often confused.
+
+OVS actually has two different flow concepts:
+
+| OpenFlow flows | Datapath flows |
+| --- | --- |
+| Managed by OVS control plane | Used by packet-processing datapath |
+| Configured using `ovs-ofctl` | Inspected using `ovs-appctl dpctl` |
+| Logical switching rules | Optimized packet-processing rules |
+| Can contain multiple tables and complex logic | Usually represent specific packet-processing paths |
+
+For example:
+
+An OpenFlow rule might say:
+
+```bash
+ovs-ofctl add-flow br0 \
+"priority=100,in_port=1,ip,actions=output:2"
+```
+
+OVS translates the logical processing decision into datapath operations.
+
+The datapath may then install a more specific flow to accelerate subsequent packets.
+
+### The bigger picture
+
+There are actually three levels worth understanding:
+
+```text 
+
+    +--------------------------------------------------------------+
+    | Level 1                                                      |
+    | **OpenFlow**                                                 |
+    | Logical forwarding policy. What should happen to packets?    |
+    +--------------------------------------------------------------+
+    | Level 2                                                      |
+    | **Software Datapath Flows**                                  |
+    | Kernel or userspace implementation of forwarding decisions.  |
+    +--------------------------------------------------------------+
+    | Level 3                                                      |
+    | Hardware Offloaded Flows                                     |
+    | NIC implements supported forwarding decisions directly in hw.|
+    +--------------------------------------------------------------+
+
+```
+
+
+
+
 
 Todo: Order of reading
 
