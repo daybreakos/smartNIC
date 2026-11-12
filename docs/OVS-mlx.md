@@ -27,7 +27,7 @@ The important callback is:
 .ndo_setup_tc = mlx5e_setup_tc
 ```
 
-This is the entry point through which the Linux networking stack can ask the driver to configure traffic-control functionality.
+**This is the entry point through which the Linux networking stack can ask the driver to configure traffic-control functionality**.
 
 However, `ndo_setup_tc()` is not exclusively an OVS callback.
 
@@ -669,3 +669,591 @@ This would let you see the actual driver execution rather than relying only on d
 One important distinction for our next step: Your NIC is currently in legacy mode. We can first study the `NIC_OFFLOAD` path using its normal netdev. Later, we can switch to switchdev and study the `ESW_OFFLOAD` / FDB path, which is arguably even more interesting for OVS because it exposes the embedded switch and representor architecture.
 
 That's the path I would take: understand the actual C implementation first, then watch it execute on your ConnectX-6 Dx.
+
+---
+
+
+# OVS interacts with driver:
+
+
+The driver's `ndo_setup_tc()` callback is the entry point through which the Linux kernel asks the network
+driver to configure traffic-control functionality.
+
+In our case:
+
+```c
+static const struct net_device_ops mlx5e_netdev_ops = {
+    .ndo_setup_tc = mlx5e_setup_tc,
+};
+```
+
+The sequence is:
+
+1. OVS (`ovs-vswitchd`) decides that a flow should be offloaded.
+2. OVS submits a TC flower rule through the kernel's TC/Netlink infrastructure.
+3. The Linux kernel processes that request.
+4. The kernel invokes the network driver's `ndo_setup_tc()` callback.
+5. The Mellanox driver (`mlx5e_setup_tc()`) handles the request.
+
+The important nuance: OVS does not directly call `mlx5e_setup_tc()`. It communicates with the kernel, and
+the kernel invokes the driver's callback.
+
+Think of it this way:
+
+- OVS speaks to Linux TC.
+- Linux TC speaks to the network driver.
+- The mlx5 driver translates the request into hardware flow-steering rules.
+
+That's the fundamental architecture to understand.
+
+---
+
+There is one important distinction: we don't just want to understand generic Linux **TC**. We want to
+understand how the mlx5 driver connects Linux TC flower to the hardware **eSwitch**.
+
+--- 
+
+## 1. The architecture in switchdev mode
+
+In **switchdev** mode, the ConnectX-6 Dx exposes an embedded switch (**eSwitch**) with representor interfaces.
+
+Conceptually:
+
+```text
+                 OVS userspace
+                 ovs-vswitchd
+                      |
+                      v
+                OVS datapath
+                      |
+                      v
+                 Linux TC
+                TC flower
+                      |
+                      v
+             ndo_setup_tc()
+                      |
+                      v
+              mlx5e_setup_tc()
+                      |
+                      v
+          mlx5e_setup_tc_block_cb()
+                      |
+                      v
+       mlx5e_setup_tc_cls_flower()
+                      |
+                      v
+          mlx5e_configure_flower()
+                      |
+                      v
+             mlx5e_tc_add_flow()
+                      |
+                      v
+             mlx5e_add_fdb_flow()
+                      |
+                      v
+                eSwitch FDB
+                      |
+                      v
+           mlx5 flow steering
+                      |
+                      v
+              NIC hardware
+```
+
+The important difference from legacy NIC offload is that we are now interested in the FDB (Forwarding
+Database) flow tables rather than the NIC's own ingress flow tables.
+
+## 2. What we need to understand inside mlx5
+
+I'd divide the investigation into five areas.
+
+| Area | What we need to understand | Main source |
+| --- | --- | --- |
+| Representors | How PF, VF and uplink ports are represented in Linux | `en_rep.c` |
+| TC callback | How flower requests enter the driver | `en_tc.c` |
+| Match translation | How TC match fields become mlx5 match specifications | `en_tc.c` |
+| Action translation | How redirect, drop, VLAN, tunnel and other actions are implemented | `en_tc.c` |
+| Hardware programming | How rules are inserted into eSwitch FDB tables | `eswitch_offloads.c`, `fs_core.c`, `fs_cmd.c` |
+
+The most important function to investigate is:
+
+```c
+mlx5e_add_fdb_flow()
+```
+
+It is the eSwitch counterpart to:
+
+```c
+mlx5e_add_nic_flow()
+```
+
+The driver parses the flower match, parses the actions using `parse_tc_fdb_actions()`, and eventually
+calls `mlx5e_tc_add_fdb_flow()`.
+
+## 3. One particularly important concept: representors
+
+DOCA Switching - NVIDIA Docs
+
+[docs.nvidia.com](<https://docs.nvidia.com/doca/archive/3-2-2/doca-switching/index.html?utm_source=chatgpt.com>)
+
+In switchdev mode, the representors are essential.
+
+Think of them as Linux network interfaces representing physical or virtual ports inside the NIC's
+embedded switch.
+
+For example:
+
+```text
+             ConnectX-6 Dx
+        +----------------------+
+        |                      |
+        |     Embedded Switch  |
+        |                      |
+        |   +--------------+   |
+        |   |   Uplink     |   |
+        |   +--------------+   |
+        |          |           |
+        |   +--------------+   |
+        |   |   VF 0       |   |
+        |   +--------------+   |
+        |          |           |
+        |   +--------------+   |
+        |   |   VF 1       |   |
+        |   +--------------+   |
+        |                      |
+        +----------------------+
+              |    |    |
+              v    v    v
+             Linux representors
+```
+
+OVS can attach these representors to its bridge and use TC flower rules to program forwarding between them.
+
+The Linux kernel documentation describes this switchdev architecture and the mlx5 bridge-offload support.
+
+The Linux Kernel documentation
+
+## 4. My recommended learning sequence
+
+I'd study it in this order:
+
+1. Switchdev architecture: Understand the eSwitch, vports, uplink and representors.
+2. TC flower integration: Understand how `ndo_setup_tc()` and the representor callbacks work.
+3. FDB flow creation: Follow `mlx5e_add_fdb_flow()`.
+4. Match parsing: Follow `parse_cls_flower()`.
+5. Action parsing: Follow `parse_tc_fdb_actions()`.
+6. Hardware insertion: Follow `mlx5e_tc_add_fdb_flow()` down into the flow-steering infrastructure.
+
+## 5. The question I would investigate first
+
+Before diving into the implementation, I want to establish one important concept:
+
+When OVS installs a TC flower rule on a representor, how does the mlx5 driver know which eSwitch port is the source of the packet and which eSwitch port should receive it?
+
+This is fundamental to understanding hardware forwarding.
+
+It will lead us naturally to:
+
+- `struct mlx5_eswitch_rep`
+- `struct mlx5_esw_flow_attr`
+- `in_rep`
+- `out_rep`
+- `mlx5e_add_fdb_flow()`
+
+
+--- 
+
+However, understanding some of its concepts will help considerably.
+
+I'd approach it in layers.
+
+## 1. What you need to understand first
+
+Focus on these concepts:
+
+1. eSwitch: The embedded switch inside the ConnectX-6 Dx.
+2. Representors: Linux interfaces representing eSwitch ports (PF, VF, uplink).
+3. Vports: The hardware switch ports associated with those interfaces.
+4. FDB (Forwarding Database): The hardware flow tables responsible for eSwitch forwarding.
+5. TC flower: How Linux represents match/action rules.
+
+## 2. My proposed investigation order
+
+I'd suggest this sequence:
+
+1. eSwitch architecture
+   Understand PF, VF, uplink, vports and representors.
+2. Switchdev implementation in mlx5
+   Study how the driver enables switchdev mode and creates representors.
+   Main file: `eswitch.c`, `en_rep.c`.
+3. TC flower implementation
+   Study `ndo_setup_tc()` and the callback registration mechanism.
+   Main file: `en_main.c`, `en_tc.c`.
+4. FDB flow creation
+   Follow `mlx5e_add_fdb_flow()` and the match/action parsing.
+5. Hardware flow steering
+   Follow `mlx5_add_flow_rules()` into `fs_core.c` and the lower-level command implementation.
+
+My recommendation: Start with the eSwitch and representor architecture, not ASAP².
+
+## 3. What you can postpone
+
+You don't need to understand these in detail yet:
+
+- ASAP² architecture internals.
+- Hardware pipeline implementation.
+- Firmware command encoding.
+- Detailed hardware steering optimizations.
+- Connection tracking and advanced flow acceleration.
+
+
+---
+
+# MLX ewitch:
+
+
+To understand Mellanox's TC implementation in `switchdev` mode, we first need to understand two
+fundamental concepts:
+
+1. `eSwitch (Embedded Switch)`: The hardware switch inside the CX-6 Dx that forwards packets between its ports.
+2. `Representors`: Linux network interfaces that represent those hardware switch ports and allow software
+   such as OVS to control them.
+
+*The relationship is simple*:
+
+The eSwitch is the hardware being controlled. Representors are the software interfaces used to control it.
+
+Let's build the picture from the hardware upward.
+
+## 1. What is the eSwitch?
+
+Your ConnectX-6 Dx is more than a network interface card. It also contains switching functionality.
+
+For example, imagine that your NIC has:
+
+- One physical Ethernet connection to the external network.
+- One PF (Physical Function).
+- Two VFs (Virtual Functions).
+
+The NIC can internally forward packets between these entities without sending every packet through the host CPU.
+
+Conceptually:
+
+DOCA Switching - NVIDIA Docs
+
+[docs.nvidia.com](<https://docs.nvidia.com/doca/archive/3-2-2/doca-switching/index.html?utm_source=chatgpt.com>)
+
+Think of the eSwitch as an Ethernet switch implemented inside the NIC.
+
+It has several logical ports:
+
+| Port | Purpose |
+| --- | --- |
+| Uplink | Connection to the external Ethernet network |
+| PF | Physical Function |
+| VF0 | Virtual Function 0 |
+| VF1 | Virtual Function 1 |
+
+The eSwitch can forward traffic between these ports.
+
+For example:
+
+```text
+       External Network
+              |
+              |
+         Physical Port
+              |
+              v
+       +--------------+
+       |              |
+       |   eSwitch    |
+       |              |
+       +--------------+
+          |        |
+          |        |
+         VF0      VF1
+```
+
+Suppose VF0 sends a packet destined for VF1.
+
+The eSwitch can forward that packet directly to VF1.
+
+The packet doesn't need to travel through the host's Linux networking stack.
+
+This is the foundation of hardware switching and offloading.
+
+The mlx5 documentation describes this architecture and its switchdev implementation.
+
+
+## 2. What is a representor?
+
+Now comes the interesting part.
+
+How can Linux, OVS, or TC control those hardware ports?
+
+Linux needs a way to represent each hardware port as a network interface.
+
+That's exactly what a representor does.
+
+A representor is a Linux `net_device` representing a port inside the eSwitch.
+
+For example:
+
+Interface - NVIDIA Docs
+
+[docs.nvidia.com](<https://docs.nvidia.com/networking/display/mlnxofedv461000/interface?utm_source=chatgpt.com>)
+
+Conceptually, Linux might expose interfaces such as:
+
+text
+
+```text
+ens1f0np0       Physical uplink netdev
+pf0vf0          VF0 representor
+pf0vf1          VF1 representor
+```
+
+The exact names depend on the driver and system configuration.
+
+The important thing is that these interfaces are not necessarily independent physical network devices.
+
+They are software representations of ports inside the NIC's hardware switch.
+
+The Linux kernel documentation describes three primary purposes for representors:
+
+- Configure the represented port.
+- Provide a software forwarding path for packets that aren't handled by hardware offload.
+- Provide a handle through which TC and other switching rules can reference the represented port.
+  The Linux Kernel documentation
+  +1
+
+## 3. How does a representor actually work?
+
+This is the most important concept for understanding OVS.
+
+A representor has two roles: a control-plane interface and a data-plane interface.
+
+### A. Control-plane role
+
+Because a representor is a normal Linux network interface, you can configure it using familiar tools:
+
+bash
+
+```bash
+ip link show
+ip link set pf0vf0 up
+
+tc qdisc add dev pf0vf0 clsact
+
+tc filter add dev pf0vf0 ingress \
+    protocol ip flower \
+    ip_proto tcp \
+    action drop
+```
+
+You can also attach it to an OVS bridge:
+
+bash
+
+```bash
+ovs-vsctl add-port br0 pf0vf0
+```
+
+This is how OVS gets access to the virtual ports inside the NIC.
+
+### B. Data-plane role
+
+This is even more interesting.
+
+Suppose VF0 sends a packet.
+
+If the packet isn't handled by a hardware forwarding rule, it can be delivered to the host through VF0's representor.
+
+Similarly, if the host transmits a packet through VF0's representor, the driver can deliver it to VF0.
+
+Conceptually, the representor behaves like a virtual connection to the represented port.
+
+BF2 swithdev representor 方案介绍\_vf represtor-CSDN博客
+
+[blog.csdn.net](<https://blog.csdn.net/leoufung/article/details/121046338?utm_source=chatgpt.com>)
+
+This means that software switching and hardware switching can provide equivalent forwarding behavior.
+
+The difference is where the forwarding decision is executed:
+
+- Software path: Linux networking stack and OVS.
+- Hardware path: eSwitch flow tables inside the NIC.
+
+This equivalence is an important design principle of representors.
+
+
+## 4. How does OVS use representors?
+
+Now let's connect everything to our original investigation.
+
+Imagine you have:
+
+- VF0 connected to VM0.
+- VF1 connected to VM1.
+- An uplink connected to the external network.
+- An OVS bridge called `br0`.
+
+The topology looks like this:
+
+ovs offload - tycoon3 - 博客园
+
+![ovs offload](https://i-blog.csdnimg.cn/blog_migrate/33f0761b7f0114fe2366182800404f64.png)
+
+OVS sees the representors as bridge ports:
+
+```text
+                 OVS bridge br0
+              +-------------------+
+              |                   |
+              |  pf0vf0           |
+              |  pf0vf1           |
+              |  uplink           |
+              |                   |
+              +-------------------+
+                       |
+                       v
+                Linux TC flower
+                       |
+                       v
+                mlx5 driver
+                       |
+                       v
+                  NIC eSwitch
+```
+
+Suppose OVS wants to forward packets from VF0 to VF1.
+
+It can request a TC flower hardware rule equivalent to:
+
+```text
+Match:
+    Source port = VF0
+    Destination MAC = MAC of VM1
+
+Action:
+    Forward to VF1
+```
+
+The mlx5 driver translates this into an eSwitch FDB rule.
+
+The hardware can then forward packets directly:
+
+```text
+       VM0
+        |
+        v
+       VF0
+        |
+        v
+   +-----------+
+   |  eSwitch  |
+   |           |
+   |  FDB rule |
+   +-----------+
+        |
+        v
+       VF1
+        |
+        v
+       VM1
+```
+
+No OVS userspace processing is needed for each packet that matches the offloaded rule.
+
+This is the important connection: representors give OVS a software interface to the hardware switch ports, while TC flower gives OVS a mechanism to program forwarding rules into that switch.
+
+## 5. How does this relate to the mlx5 driver implementation?
+
+Now we can understand why the driver has separate code for representors and regular NIC interfaces.
+
+When operating in switchdev mode, the mlx5 driver creates representor netdevices for the eSwitch ports.
+
+The relevant source files include:
+
+| Source file | Responsibility |
+| --- | --- |
+| `eswitch.c` | eSwitch management and configuration |
+| `en_rep.c` | Representor netdevice implementation |
+| `en_rep.h` | Representor structures and definitions |
+| `en_tc.c` | TC flower parsing and flow installation |
+| `eswitch_offloads.c` | eSwitch offload infrastructure |
+
+One particularly interesting structure to investigate is:
+
+```c
+struct mlx5_eswitch_rep;
+```
+
+It represents the driver's internal representation of an eSwitch port.
+
+Another important structure is:
+
+```c
+struct mlx5_esw_flow_attr;
+```
+
+It carries eSwitch-specific flow information, including information about the ingress and egress representors.
+
+These structures will become important when we investigate how the driver translates a TC flower rule into an FDB rule.
+
+## 6. Legacy mode versus switchdev mode
+
+Let's make sure we understand the difference.
+
+| Feature | Legacy mode | Switchdev mode |
+| --- | --- | --- |
+| eSwitch | Present | Present |
+| Hardware switching | Basic NIC-managed switching | Programmable offload architecture |
+| VF representors | Not exposed in the same way | Exposed |
+| TC flower offload | NIC flow domain supported | eSwitch FDB offload supported |
+| OVS hardware switching between VFs | Limited architecture | Supported through representors and FDB offload |
+
+Switchdev is what exposes the eSwitch ports through the representor architecture, allowing OVS to manage hardware switching much more directly.
+
+## 7. What I want you to remember
+
+Three concepts to keep separate
+
+HardwareeSwitch
+
+The actual switching engine inside the ConnectX-6 Dx.
+
+Linux interfaceRepresentor
+
+A Linux network device representing an eSwitch port.
+
+Flow managementTC flower
+
+The mechanism used to describe match/action rules that the driver can translate into hardware rules.
+
+## 8. Our next step
+
+I suggest we now inspect the actual mlx5 source code, starting with:
+
+```text
+drivers/net/ethernet/mellanox/mlx5/core/
+    eswitch.c
+    en_rep.c
+    en_rep.h
+```
+
+I particularly want to understand:
+
+1. Who creates the representor netdevices?
+2. How does the driver associate a representor with a specific eSwitch vport?
+3. How does `ndo_setup_tc()` on a representor reach the TC flower implementation?
+4. How does the driver know which hardware port is the ingress port when installing an FDB rule?
+
+Question 4 is especially important: it explains how a Linux TC rule attached to a representor becomes a hardware rule associated with the correct eSwitch port.
+
+That's where we'll start connecting the architecture to the actual C implementation.
+
+---
+
