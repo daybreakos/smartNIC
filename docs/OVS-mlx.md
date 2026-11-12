@@ -795,7 +795,7 @@ calls `mlx5e_tc_add_fdb_flow()`.
 
 DOCA Switching - NVIDIA Docs
 
-[docs.nvidia.com](<https://docs.nvidia.com/doca/archive/3-2-2/doca-switching/index.html?utm_source=chatgpt.com>)
+[docs.nvidia.com](https://docs.nvidia.com/doca/archive/3-2-2/doca-switching/index.html)
 
 In switchdev mode, the representors are essential.
 
@@ -922,13 +922,15 @@ fundamental concepts:
 
 *The relationship is simple*:
 
-The eSwitch is the hardware being controlled. Representors are the software interfaces used to control it.
+The eSwitch is the hardware being controlled. 
+
+**Representors** are the software interfaces used to control it.
 
 Let's build the picture from the hardware upward.
 
 ## 1. What is the eSwitch?
 
-Your ConnectX-6 Dx is more than a network interface card. It also contains switching functionality.
+ConnectX-6 Dx is more than a network interface card. It also contains switching functionality.
 
 For example, imagine that your NIC has:
 
@@ -942,7 +944,7 @@ Conceptually:
 
 DOCA Switching - NVIDIA Docs
 
-[docs.nvidia.com](<https://docs.nvidia.com/doca/archive/3-2-2/doca-switching/index.html?utm_source=chatgpt.com>)
+[DOCA Switching Docs ](https://docs.nvidia.com/doca/archive/3-2-2/doca-switching/index.html)
 
 Think of the eSwitch as an Ethernet switch implemented inside the NIC.
 
@@ -984,7 +986,7 @@ The packet doesn't need to travel through the host's Linux networking stack.
 
 This is the foundation of hardware switching and offloading.
 
-The mlx5 documentation describes this architecture and its switchdev implementation.
+The mlx5 documentation describes this architecture and its **switchdev** implementation.
 
 
 ## 2. What is a representor?
@@ -995,15 +997,15 @@ How can Linux, OVS, or TC control those hardware ports?
 
 Linux needs a way to represent each hardware port as a network interface.
 
-That's exactly what a representor does.
+That's exactly what a **representor** does.
 
-A representor is a Linux `net_device` representing a port inside the eSwitch.
+A **representor** is a Linux `net_device` representing a port inside the eSwitch.
 
 For example:
 
 Interface - NVIDIA Docs
 
-[docs.nvidia.com](<https://docs.nvidia.com/networking/display/mlnxofedv461000/interface?utm_source=chatgpt.com>)
+[docs.nvidia.com](https://docs.nvidia.com/networking/display/mlnxofedv461000/interface)
 
 Conceptually, Linux might expose interfaces such as:
 
@@ -1077,7 +1079,7 @@ Conceptually, the representor behaves like a virtual connection to the represent
 
 BF2 swithdev representor 方案介绍\_vf represtor-CSDN博客
 
-[blog.csdn.net](<https://blog.csdn.net/leoufung/article/details/121046338?utm_source=chatgpt.com>)
+[blog.csdn.net](https://blog.csdn.net/leoufung/article/details/121046338)
 
 This means that software switching and hardware switching can provide equivalent forwarding behavior.
 
