@@ -828,6 +828,17 @@ OVS translates the logical processing decision into datapath operations.
 
 The datapath may then install a more specific flow to accelerate subsequent packets.
 
+ex: 
+```bash 
+ovs-ofctl add-flow br0 \
+"priority=100,ip,tcp,tp_dst=443,actions=output:2"
+```
+- Tells OVS to forward matching TCP packets destined for port 443 to OpenFlow port 2. 
+- when packet arrives `ovs-vswitchd` processes the OpenFlow pipeline and can install corresponding datapath
+  flows. 
+- The datapath flow allows subsequent matching packets to be processes efficiently without repeatedly
+  traversing the entire user-space OpenFlow pipeline. 
+
 ### The bigger picture
 
 There are actually three levels worth understanding:
@@ -850,9 +861,693 @@ There are actually three levels worth understanding:
 
 ```
 
+### Flow MISS in detail.
+
+Consider a new TCP connection:
+
+`192.168.1.10:50000 → 10.0.0.20:443`
+
+Initially, the datapath might not have a matching flow.
+
+The processing sequence is:
+
+1. The packet arrives at the datapath.
+2. The datapath cannot find a matching flow.
+3. An upcall sends packet information to ovs-vswitchd.
+4. ovs-vswitchd processes the packet through the OpenFlow pipeline.
+5. OVS determines the appropriate forwarding actions.
+6. A datapath flow can be installed.
+7. Subsequent matching packets can use the fast path.
+
+One important nuance: a miss does not necessarily mean that OVS installs a flow immediately. The result
+depends on packet processing, flow configuration, and datapath behavior.
+
+### HW offloading 
+
+Let's look at the difference between software and hardware forwarding.
+
+```mermaid 
+flowchart LR
+    subgraph SOCKET["Socket"]
+        direction LR
+        OSVDB["ovsdb-server"]
+        VSW["ovs-vswitchd"]
+    end
+
+    subgraph USER["Userspace"]
+        direction LR
+        VM["VM"]
+    end
+
+    subgraph KERNEL["Kernel"]
+        direction LR
+        subgraph KTC["Kernel TC Datapath"]
+            direction LR
+            KM["Match<br/>Tables"]
+            KA["Actions"]
+            KF["Future<br/>Features"]
+            KT["Tunnels"]
+            KM --> KA --> KF --> KT
+        end
+        OKD["OVS Kernel<br/>Datapath"]
+    end
+
+    subgraph AGILIO["Smart NIC"]
+        direction LR
+        subgraph OTC["Offload TC Datapath"]
+            direction LR
+            OM["Match<br/>Tables"]
+            OA["Actions"]
+            OF["Future<br/>Features"]
+            OT["Tunnels"]
+            OM --> OA --> OF --> OT
+        end
+        HOST["Deliver to Host"]
+    end
+
+    OSVDB --- VSW
+
+    VSW -.-> KM
+    VSW -.-> KA
+    VSW -.-> KF
+    VSW -.-> KT
+    VSW -.-> OKD
+
+    KT --> OKD
+    KT -.-> OT
+    OT --> HOST
+
+    KM -.-> OM
+    KA -.-> OA
+    KF -.-> OF
+
+    OKD <--> HOST
+    VM <--> HOST
+
+    classDef control fill:#777,color:#fff,stroke:#aaa,stroke-width:2px
+    classDef datapath fill:#294a83,color:#fff,stroke:#ddd,stroke-width:2px
+    classDef userspace fill:#3498c4,color:#fff,stroke:#fff,stroke-width:2px
+    classDef kernelnode fill:#999,color:#fff,stroke:#ddd,stroke-width:2px
+    classDef host fill:#294a83,color:#fff,stroke:#ddd,stroke-width:2px
+
+    class OSVDB,VSW control
+    class KM,KA,KF,KT,OM,OA,OF,OT datapath
+    class VM userspace
+    class OKD kernelnode
+    class HOST host
+
+    style SOCKET fill:#e5e5e5,stroke:#ccc
+    style USER fill:#e5e5e5,stroke:#ccc
+    style KERNEL fill:#aebdbc,stroke:#ccc
+    style AGILIO fill:#ffe7a3,stroke:#ccc
+    style KTC fill:#e5e5e5,stroke:#fff,stroke-width:2px
+    style OTC fill:#e5e5e5,stroke:#fff,stroke-width:2px
+```
+
+Without hardware offloading:
+
+```text 
+        NIC
+         |
+         v
+      Host CPU
+         |
+         v
+     OVS datapath
+         |
+         v
+    Forward packet
+```
+
+With hardware offloading:
+
+```text 
+            NIC
+             |
+             v
+    NIC hardware flow table
+             |
+             v
+         Match flow
+             |
+             v
+    Execute forwarding action
+             |
+             v
+        Physical port
+```
+
+The key difference is where the packet-processing work happens.
+
+However, hardware offloading does not mean that the CPU is completely eliminated. The CPU and ovs-vswitchd
+still participate in control-plane operations, flow management, exceptions, and other tasks.
 
 
+## How HW Support Flow offloading: 
 
+Hardware Flow offloading requires support from both the NIC hardware and its driver. 
+
+But there is another important component in between: the Linux kernel's networking infrastructure and the
+OVS hardware-offload integration.
+
+**OVS does not typically communicate directly with the NIC and write hardware flow-table entries itself**.
+Instead, it uses a software interface to request that the driver program the NIC.
+
+## HW flow offloading actual mechanism.
+
+### 1. The components involved
+
+Consider a system with:
+
+- Open vSwitch (`ovs-vswitchd`)
+- Linux kernel
+- NIC driver
+- NIC hardware (SmartNIC or an offload-capable NIC)
+
+The architecture looks approximately like this:
+
+```text 
+    +------------------+
+    | OVS userspace    | OpenFlow pipeline and flow management
+    | `ovs-vswitchd`   |
+    +------------------+
+        |
+        v 
+    +------------------------------------+
+    | Linux kernel                       | Hardware-offload request and flow management
+    | TC flower/switchdev infrastructure |
+    +------------------------------------+
+        |
+        v 
+    +-------------+
+    | NIC driver  | Translates flow rules into hardware-specific commands
+    +-------------+
+        |
+        v 
+    +---------------------------------------------------+
+    | NIC HW                                            | Matches packets and executes actions
+    | Hardware flow tables / packet-processing pipeline |
+    +---------------------------------------------------+
+```
+
+There are different offload implementations, but this is a useful model for understanding the common Linux
+kernel datapath TC-offload path.
+
+### 2. How does OVS actually program the NIC?
+
+There are two common mechanisms worth understanding:
+
+1. **TC flower offload**: OVS uses the Linux kernel's Traffic Control (TC) infrastructure.
+2. **DPDK rte_flow offload**: OVS uses DPDK's flow API to request hardware flow programming.
+
+Let's first understand TC flower, because it is a common implementation in Linux kernel-based OVS deployments.
+
+### Approach A: TC flower hardware offload
+
+The architecture is:
+
+```text
+          ovs-vswitchd
+               |
+               | Flow installation request
+               v
+       OVS TC offload interface
+               |
+               v
+        Linux TC subsystem
+               |
+               | Netlink messages
+               v
+         NIC kernel driver
+               |
+               | Hardware-specific commands
+               v
+          NIC firmware
+               |
+               v
+       Hardware flow tables
+```
+
+Let's understand each step.
+
+#### Step 1: OVS decides to offload a flow
+
+Suppose OVS has this forwarding rule:
+
+```text
+Match:
+    Source IP      = 192.168.1.10
+    Destination IP = 192.168.2.20
+    Protocol       = TCP
+    Destination Port = 443
+
+Action:
+    Output to port 5
+```
+
+After processing a packet and determining the forwarding behavior, OVS attempts to install an equivalent
+datapath flow in hardware.
+
+It translates the flow into a representation understood by the Linux TC flower interface.
+
+#### Step 2: OVS uses TC flower
+
+TC flower is a Linux traffic-control classifier that supports matching packet fields and executing actions.
+
+For example, a simplified equivalent TC rule might look like:
+
+```bash
+tc filter add dev eth0 ingress protocol ip \
+    flower \
+    src_ip 192.168.1.10 \
+    dst_ip 192.168.2.20 \
+    ip_proto tcp \
+    dst_port 443 \
+    skip_sw \
+    action mirred egress redirect dev eth1
+```
+
+Here:
+
+- `flower` defines the packet matching criteria.
+- `src_ip` and `dst_ip` specify IP matching.
+- `ip_proto` specifies TCP.
+- `dst_port` specifies the destination port.
+- `mirred` specifies a redirect action.
+- `skip_sw` requests hardware-only processing rather than a software fallback.
+
+This is an illustrative equivalent rule, not necessarily the exact rule OVS generates.
+
+The important point is that OVS communicates the flow to Linux TC using the kernel's networking interfaces.
+
+#### Step 3: Linux communicates with the NIC driver
+
+This is where things get interesting.
+
+The TC subsystem receives the flow configuration through Netlink.
+
+It then invokes the driver's hardware-offload implementation.
+
+For network drivers, an important kernel interface is:
+
+```c
+ndo_setup_tc()
+```
+
+This is a callback exposed through the network device's `net_device_ops`.
+
+Conceptually:
+
+```c
+static const struct net_device_ops my_netdev_ops = {
+    .ndo_setup_tc = my_driver_setup_tc,
+};
+```
+
+The driver implements this callback to handle TC configuration requests.
+
+The driver can then:
+
+- Validate the requested match fields.
+- Check whether the requested actions are supported.
+- Allocate hardware flow-table resources.
+- Translate the rule into NIC-specific commands.
+- Program the hardware.
+
+Not every driver implements every TC feature. The supported capabilities depend on the driver and NIC.
+
+#### Step 4: The driver programs NIC hardware
+
+Now the NIC driver communicates with the NIC's hardware/firmware interface.
+
+For example, consider an NVIDIA ConnectX NIC using the `mlx5` driver.
+
+The driver has hardware-specific flow-management infrastructure. It translates the requested TC rule into the NIC's internal flow steering representation.
+
+The NIC may have structures such as:
+
+- Flow tables.
+- Flow groups.
+- Flow entries.
+- Match criteria.
+- Forwarding destinations.
+- Modify-header actions.
+
+The hardware can then execute these rules directly.
+
+The exact implementation is vendor-specific.
+
+This is the key point: OVS does not need to understand the internal hardware flow-table format of every NIC. The driver handles that translation.
+
+References: [OVS TC flower offload documentation](https://docs.openvswitch.org/en/latest/howto/tc-offload/) · [Red Hat TC flower offload architecture](https://docs.redhat.com/en/documentation/red_hat_openstack_platform/17.1/html/configuring_network_functions_virtualization/config-ovs-hwol_rhosp-nfv).
+
+#### 3. What exactly does the NIC driver do?
+
+Let's take `mlx5_core` as an example.
+
+Suppose the kernel receives this request:
+
+```text
+Match:
+    Source IP      = 192.168.1.10
+    Destination IP = 192.168.2.20
+    TCP destination port = 443
+
+Action:
+    Redirect to destination port
+```
+
+The driver needs to translate this generic request into something the NIC understands.
+
+Conceptually, the process is:
+
+```text
+    TC flower rule
+          |
+          v
+    mlx5 driver receives request
+          |
+          v
+    Validate match fields
+          |
+          v
+    Validate actions
+          |
+          v
+    Allocate hardware flow entry
+          |
+          v
+    Create NIC flow-steering rule
+          |
+          v
+    NIC firmware / hardware
+          |
+          v
+    Rule installed
+```
+
+For example, the hardware might represent the rule conceptually as:
+
+```text
++---------------------------------------+
+| NIC Hardware Flow Table               |
++---------------------------------------+
+|                                       |
+| Entry 1                               |
+|                                       |
+| Match:                                |
+|   IPv4 source      = 192.168.1.10     |
+|   IPv4 destination = 192.168.2.20     |
+|   IP protocol      = TCP              |
+|   TCP destination  = 443              |
+|                                       |
+| Action:                               |
+|   Forward to eSwitch port 5           |
+|                                       |
++---------------------------------------+
+```
+
+This is conceptual, not the actual binary hardware representation.
+
+The NIC's firmware and hardware implement the vendor-specific flow-steering pipeline.
+
+For NVIDIA ConnectX devices, this is commonly associated with the NIC's embedded switch (eSwitch) and hardware steering infrastructure.
+
+#### 4. Approach B: DPDK rte\_flow offloading
+
+There is another important path, particularly when OVS uses DPDK.
+
+Instead of going through Linux TC flower, OVS can use the DPDK `rte_flow` API.
+
+The architecture becomes:
+
+```text
+             ovs-vswitchd
+                  |
+                  v
+            OVS DPDK datapath
+                  |
+                  v
+           DPDK rte_flow API
+                  |
+                  v
+             DPDK PMD
+         (Poll Mode Driver)
+                  |
+                  v
+          NIC-specific driver
+                  |
+                  v
+           NIC firmware
+                  |
+                  v
+         Hardware flow tables
+```
+
+Here is an illustrative DPDK flow-programming example:
+
+```c
+struct rte_flow_attr attr = {
+    .ingress = 1,
+};
+
+struct rte_flow_item pattern[] = {
+    // Ethernet
+    // IPv4
+    // TCP
+    // End
+};
+
+struct rte_flow_action actions[] = {
+    // Redirect to destination port
+    // End
+};
+
+struct rte_flow_error error;
+
+struct rte_flow *flow;
+
+flow = rte_flow_create(
+    port_id,
+    &attr,
+    pattern,
+    actions,
+    &error
+);
+```
+
+The important function is:
+
+```c
+rte_flow_create()
+```
+
+It asks the PMD to create a flow rule.
+
+The PMD translates the generic DPDK flow description into hardware-specific operations.
+
+If the NIC supports the requested pattern and actions, it programs the hardware.
+
+Notice the difference:
+
+| TC flower | DPDK rte\_flow |
+| --- | --- |
+| Uses Linux TC infrastructure | Uses DPDK flow API |
+| Uses Netlink to configure TC | Uses DPDK PMD APIs |
+| Driver implements kernel offload support | PMD implements DPDK flow support |
+| Common in kernel datapath OVS | Common in OVS-DPDK |
+
+DPDK hardware offloading also depends on the PMD supporting the requested flow patterns and actions.
+
+#### 5. Does every flow get offloaded?
+
+No. This is a very important detail.
+
+Suppose you request:
+
+```text
+Match:
+    Source IP = 192.168.1.10
+    Destination IP = 192.168.2.20
+
+Actions:
+    NAT
+    Connection tracking
+    Output to port 5
+```
+
+Your NIC might support:
+
+- IPv4 matching.
+- TCP matching.
+- VLAN operations.
+- Packet redirection.
+- Packet modification.
+
+But it might not support the complete connection-tracking or NAT behavior requested.
+
+In that situation, OVS cannot necessarily offload the entire flow.
+
+Depending on the datapath and supported features, it might:
+
+- Offload the supported portion.
+- Keep the flow in software.
+- Reject the offload request.
+- Use a combination of hardware and software processing.
+
+This is why hardware-offload capability is not simply a yes/no property.
+
+It depends on the specific combination of:
+
+1. NIC hardware.
+2. NIC firmware.
+3. Kernel driver.
+4. Linux kernel support.
+5. OVS version.
+6. Requested match fields and actions.
+
+#### 6. How do you enable and verify hardware offloading?
+
+Let's use the TC flower implementation as an example.
+
+##### Enable hardware offloading in OVS
+
+
+```bash
+sudo ovs-vsctl set Open_vSwitch . \
+    other_config:hw-offload=true
+```
+
+OVS also supports configuring its TC offload policy:
+
+```bash
+sudo ovs-vsctl set Open_vSwitch . \
+    other_config:tc-policy=none
+```
+
+The policies are:
+
+| Policy | Behavior |
+| --- | --- |
+| `none` | Install rules in both software and hardware where supported |
+| `skip_sw` | Require hardware offloading |
+| `skip_hw` | Use software only |
+
+The exact behavior is documented in the NVIDIA driver documentation.
+
+##### Enable TC hardware offload on the NIC
+
+Check whether the driver exposes the capability:
+
+bash
+
+```bash
+ethtool -k eth0 | grep hw-tc-offload
+```
+
+Enable it if supported:
+
+bash
+
+```bash
+sudo ethtool -K eth0 hw-tc-offload on
+```
+
+##### Inspect installed TC rules
+
+bash
+
+```bash
+sudo tc -s -d filter show dev eth0 ingress
+```
+
+This displays TC flower rules and their statistics.
+
+##### Inspect OVS datapath flows
+
+bash
+
+```bash
+sudo ovs-appctl dpctl/dump-flows
+```
+
+You can also inspect the OVS logs for hardware-offload failures and unsupported actions.
+
+#### 7. Putting everything together
+
+Here is the complete picture.
+
+Understanding OpenVswitch Hardware Offloading | kp0zhiqian's
+
+|  | [kp0zhiqian.github.io](https://kp0zhiqian.github.io/posts/hardware_offload/) |
+| :-- | :---: | 
+|  | ![kp0zhiqian.github.io](https://kp0zhiqian.github.io/post-image/hw-ol/ovs-tc.png =480x) |
+
+
+```text
+                OpenFlow Rule
+                      |
+                      v
+                 ovs-vswitchd
+                      |
+                      v
+                OVS Datapath
+                      |
+                      v
+             Hardware Offload Request
+                      |
+              +-------+-------+
+              |               |
+              v               v
+          TC Flower         DPDK
+              |               |
+              v               v
+         Linux Kernel      rte_flow API
+              |               |
+              v               v
+          TC Subsystem      DPDK PMD
+              |               |
+              v               v
+          NIC Driver       NIC Driver
+              |               |
+              +-------+-------+
+                      |
+                      v
+                 NIC Firmware
+                      |
+                      v
+              Hardware Flow Table
+                      |
+                      v
+              Hardware Forwarding
+```
+
+The two paths are alternatives, not necessarily sequential stages.
+
+## 8. The most important takeaway
+
+Think of the responsibilities this way:
+
+| Component | Responsibility |
+| --- | --- |
+| OVS | Decides which flows and actions should be offloaded |
+| TC / DPDK | Provides the interface for requesting flow programming |
+| NIC driver / PMD | Translates generic flow requests into hardware-specific operations |
+| NIC firmware | Manages hardware resources and flow-steering configuration |
+| NIC hardware | Performs packet matching and forwarding |
+
+OVS does not directly program the NIC registers or implement every vendor's hardware flow-table format. It requests offloading through a standard software interface, and the driver handles the hardware-specific implementation.
+
+For further reading, these are particularly useful:
+
+- [Open vSwitch – Flow Hardware Offload with Linux TC flower](https://docs.openvswitch.org/en/latest/howto/tc-offload/)
+- [Open vSwitch – DPDK Hardware Offloading](https://github.com/openvswitch/ovs/blob/main/Documentation/howto/dpdk.rst)
+- [NVIDIA – OVS-DPDK Hardware Acceleration](https://networking-docs.nvidia.com/doca/archive/3-2-0/ovs-dpdk-hardware-acceleration)
+
+My recommendation for your next learning step: Study the NVIDIA `mlx5` driver and its TC flower implementation. It is an excellent real-world example of how a generic Linux TC flow eventually becomes a hardware flow-steering rule inside a NIC.
+
+
+--------------------------------------------------------------
 
 Todo: Order of reading
 
