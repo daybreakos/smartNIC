@@ -1,4 +1,4 @@
-# OVS Mellanox HW Flag offloading 
+# OVS Mellanox HW Flow offloading 
 
 
 When OVS wants to offload a flow, how does the request enter the Mellanox driver, which functions process
